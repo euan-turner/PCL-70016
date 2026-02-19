@@ -476,3 +476,49 @@ def keyword_stratified_split(
 
     return {"train": train, "val": val, "test": test}
 
+
+def load_official_splits(
+    items: List[PCLItem],
+    splits_dir: str = "Dont_Patronize_Me_Trainingset/practice splits",
+) -> Dict[str, List[PCLItem]]:
+    """Split items according to the official SemEval train/dev par_id lists.
+
+    The split CSV files contain ``par_id,label`` rows.  We only use par_id
+    to partition *items* into ``train`` and ``dev`` sets.  Items whose
+    par_id appears in neither file are reported but excluded.
+
+    Returns
+    -------
+    dict with keys ``"train"`` and ``"dev"``, each a list of PCLItem.
+    """
+    import csv, os
+
+    def _load_par_ids(path: str) -> set:
+        ids = set()
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ids.add(int(row["par_id"]))
+        return ids
+
+    train_ids = _load_par_ids(os.path.join(splits_dir, "train_semeval_parids-labels.csv"))
+    dev_ids   = _load_par_ids(os.path.join(splits_dir, "dev_semeval_parids-labels.csv"))
+
+    train, dev, unmatched = [], [], []
+    for item in items:
+        if item.par_id in train_ids:
+            train.append(item)
+        elif item.par_id in dev_ids:
+            dev.append(item)
+        else:
+            unmatched.append(item)
+
+    print(f"Official split: train={len(train)}, dev={len(dev)}")
+    if unmatched:
+        print(f"  (!) {len(unmatched)} items not in either split file — excluded")
+    for name, data in [("train", train), ("dev", dev)]:
+        pcl = sum(1 for x in data if x.is_pcl)
+        print(f"  {name}: {pcl}/{len(data)} PCL ({pcl/len(data)*100:.1f}%)")
+
+    return {"train": train, "dev": dev}
+
