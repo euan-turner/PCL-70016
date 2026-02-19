@@ -1,0 +1,19 @@
+
+
+Approach:
+1. Fine-tune DeBERTa-v3-large (304M) using LoRA
+2. Sweep LoRA rank over (8, 16, 32, 64)
+3. Exclude keyword from input, using keyword-stratified cross-validation
+4. Oversample from PCL examples to improve balance
+5. Use back-translation to augment PCL examples and improve diversity
+6. Use span-level PCL annotations to swap spans and create new positive examples
+
+7. Maybe combine with a class-weighted loss instead of oversampling
+8. Maybe train a PCL category predictor attached to the same encoder as the binary classifier, so the encoder gets more signal
+
+General pre-processing:
+1. strip HT<L tags and decode HTML entities
+2. Remove empty/near-empty samples (< 3 tokens)
+3. Normalise whitespace and quotations
+4. Maybe replace entitities with type tokens
+5. Keyword-stratified train/val split
