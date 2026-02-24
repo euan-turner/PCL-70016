@@ -54,7 +54,7 @@ LORA_RANKS = [8, 16, 32, 64]
 LORA_ALPHA_MULT = 2       # = alpha / rank
 LORA_DROPOUT = 0.1
 TARGET_MODULES = ["query_proj", "key_proj", "value_proj"]  # DeBERTa-v2 attention projections
-N_FOLDS = 3
+N_FOLDS = 2
 SEED = 42
 EPOCHS = 15
 BATCH_SIZE = 8

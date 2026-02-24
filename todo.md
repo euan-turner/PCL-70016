@@ -1,0 +1,4 @@
+- [ ] Evaluate baseline model (deberta-v3-large) after training a classifier head on frozen backbone
+- [ ] CV for each LoRA rank with no handling of class imbalance (baseline)
+- [ ] CV for each LoRA rank with different handling of class imbalance
+- [ ] Train best LoRA rank with back-translated augmentations
