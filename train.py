@@ -165,11 +165,19 @@ def oversample_minority(records: List[Dict], seed: int = SEED) -> List[Dict]:
     return [records[i] for i in all_idx]
 
 
-def build_lora_model(rank: int):
-    """Load pretrained DeBERTa-v3-large and attach LoRA adapters."""
+def build_lora_model(rank: Optional[int]):
+    """Load pretrained DeBERTa-v3-large and attach LoRA adapters.
+
+    If `rank` is None the base model is returned and no PEFT/LoRA is applied.
+    """
     base = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, num_labels=2, torch_dtype=torch.float32,
     )
+
+    if rank is None:
+        log.info("  No LoRA/PEFT requested — using base model")
+        return base
+
     cfg = LoraConfig(
         task_type=TaskType.SEQ_CLS,
         r=rank,
@@ -195,6 +203,8 @@ def train_fold(
     class_weights: Optional[torch.Tensor],
     output_dir: Path,
     args: argparse.Namespace,
+    model: Optional[nn.Module] = None,
+    freeze_backbone: bool = False,
 ) -> Dict[str, float]:
     """Train one (fold, rank) combination. Returns val metrics dict."""
     log.info(f"  Fold {fold}  train={len(train_records)}  val={len(val_records)}")
@@ -206,7 +216,34 @@ def train_fold(
     train_ds = PCLFinetuneDataset(train_records, tokenizer, args.max_length)
     val_ds = PCLFinetuneDataset(val_records, tokenizer, args.max_length)
 
-    model = build_lora_model(rank)
+    # If a model was provided (e.g. baseline), use it; otherwise build/apply LoRA
+    if model is None:
+        model = build_lora_model(rank)
+    else:
+        log.info("  Using provided base model (no LoRA applied)")
+
+    # Optionally freeze the backbone and leave only the classification head trainable
+    if freeze_backbone:
+        for n, p in model.named_parameters():
+            p.requires_grad = False
+
+        # Try common classifier attribute names, otherwise fall back to name matching
+        if hasattr(model, "classifier"):
+            for p in model.classifier.parameters():
+                p.requires_grad = True
+        elif hasattr(model, "score"):
+            for p in model.score.parameters():
+                p.requires_grad = True
+        else:
+            for n, p in model.named_parameters():
+                if "classifier" in n or "pooler" in n or "out_proj" in n:
+                    p.requires_grad = True
+
+        # Log count of trainable params
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        log.info(f"  Frozen backbone — trainable {trainable:,} / {total:,} "
+                 f"({100 * trainable / total:.2f}%)")
 
     run_dir = output_dir / f"rank{rank}_fold{fold}"
     training_args = TrainingArguments(
@@ -303,6 +340,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--dry-run", action="store_true",
                         help="Print config and exit without training")
+    parser.add_argument("--baseline", action="store_true", help="Run baseline evaluation with frozen backbone")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -322,6 +360,34 @@ def main():
         for k, v in vars(args).items():
             log.info(f"  {k}: {v}")
         build_lora_model(args.ranks[0])  # show param counts
+        return
+
+    if args.baseline:
+        log.info("Running baseline evaluation with frozen backbone")
+        train_data = load_json(args.data_dir / f"train{suffix}.json")
+        dev_data = load_json(args.data_dir / f"dev{suffix}.json")
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        class_weights = compute_class_weights(train_data)
+
+        # Load the base model directly
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=2)
+        model.requires_grad_(False)  # Freeze the backbone
+        model.classifier.requires_grad_(True)  # Unfreeze the classifier head
+
+        m = train_fold(
+            fold=0,
+            rank=None,  # Skip LoRA or any PEFT application
+            train_records=train_data,
+            val_records=dev_data,
+            tokenizer=tokenizer,
+            class_weights=class_weights,
+            output_dir=args.output_dir,
+            args=args,
+            model=model,
+            freeze_backbone=True,  # Ensure backbone is frozen
+        )
+        log.info(f"Baseline evaluation →  F1={m['f1']:.4f}  P={m['precision']:.4f}  R={m['recall']:.4f}")
         return
 
     # Rank sweep
