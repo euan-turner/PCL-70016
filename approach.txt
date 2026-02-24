@@ -1,3 +1,4 @@
+Need to beat an F1 of 0.48 on the dev set
 
 
 Approach:
