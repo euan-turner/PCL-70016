@@ -1,0 +1,39 @@
+{
+  "config": {
+    "ranks": [
+      32
+    ],
+    "folds": 2,
+    "epochs": 10,
+    "batch_size": 16,
+    "lr": 0.0001,
+    "max_length": 128,
+    "balance": "oversample",
+    "masked": false,
+    "seed": 42,
+    "data_dir": "preprocessed",
+    "output_dir": "outputs",
+    "dry_run": false,
+    "baseline": false
+  },
+  "results": {
+    "32": {
+      "mean_f1": 0.4272529954390133,
+      "std_f1": 0.01588425946294747,
+      "mean_precision": 0.3276570130801544,
+      "mean_recall": 0.6309823677581864,
+      "folds": [
+        {
+          "f1": 0.4113687359760658,
+          "precision": 0.2925531914893617,
+          "recall": 0.6926952141057935
+        },
+        {
+          "f1": 0.44313725490196076,
+          "precision": 0.36276083467094705,
+          "recall": 0.5692695214105793
+        }
+      ]
+    }
+  }
+}
