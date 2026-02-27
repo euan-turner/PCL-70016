@@ -123,22 +123,21 @@ class WeightedTrainer(Trainer):
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
-    return {
-        "f1": f1_score(labels, preds, pos_label=1, zero_division=0),
-        "precision": precision_score(labels, preds, pos_label=1, zero_division=0),
-        "recall": recall_score(labels, preds, pos_label=1, zero_division=0),
-    }
+    f1 = f1_score(labels, preds, pos_label=1, zero_division=0)
+    precision = precision_score(labels, preds, pos_label=1, zero_division=0)
+    recall = recall_score(labels, preds, pos_label=1, zero_division=0)
+    return {"f1": f1, "precision": precision, "recall": recall}
 
 def load_json(path: Path) -> List[Dict]:
     with open(path) as f:
         return json.load(f)
 
 
-def compute_class_weights(records: List[Dict]) -> torch.Tensor:
-    """Inverse-frequency weights: w_c = N / (C × n_c)."""
+def compute_class_weights(records: List[Dict], alpha=1.0) -> torch.Tensor:
+    """Dampened nverse-frequency weights: w_c = N / (C × n_c)."""
     labels = [r["label_binary"] for r in records]
     counts = np.bincount(labels, minlength=2).astype(float)
-    weights = len(labels) / (2.0 * counts)
+    weights = (len(labels) / (2.0 * counts)) ** alpha
     log.info(f"Class weights  NO_PCL={weights[0]:.3f}  PCL={weights[1]:.3f}")
     return torch.tensor(weights, dtype=torch.float32)
 
@@ -187,13 +186,6 @@ def build_lora_model(rank: Optional[int]):
         bias="none",
     )
     model = get_peft_model(base, cfg)
-    
-    # Fix classifier head initialisation
-    for module in model.modules():
-        if isinstance(module, nn.Linear) and module.out_features == 2:
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
 
     trainable, total = model.get_nb_trainable_parameters()
     log.info(f"  LoRA r={rank}  trainable {trainable:,} / {total:,} "
@@ -214,12 +206,22 @@ def train_fold(
     model: Optional[nn.Module] = None,
     freeze_backbone: bool = False,
 ) -> Dict[str, float]:
+    
+    dev_data = load_json(args.data_dir / "dev.json")
+    val_records = dev_data  # override fold val
+    
+    log.info(f"DEBUG: forcing val_records to dev.json ({len(val_records)} samples)")
+    
     """Train one (fold, rank) combination. Returns val metrics dict."""
     log.info(f"  Fold {fold}  train={len(train_records)}  val={len(val_records)}")
+    
+    log.info(f"  val set size: {len(val_records)}, PCL in val: {sum(r['label_binary'] for r in val_records)}")
+    log.info(f"  train set size before oversample: {len(train_records)}, PCL: {sum(r['label_binary'] for r in train_records)}")
 
     # Optionally oversample
     if args.balance in ("oversample", "both"):
         train_records = oversample_minority(train_records, seed=args.seed)
+        log.info(f"  train set size after oversample: {len(train_records)}, PCL: {sum(r['label_binary'] for r in train_records)}")
 
     train_ds = PCLFinetuneDataset(train_records, tokenizer, args.max_length)
     val_ds = PCLFinetuneDataset(val_records, tokenizer, args.max_length)
@@ -287,10 +289,17 @@ def train_fold(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=PATIENCE)],
+        # callbacks=[EarlyStoppingCallback(early_stopping_patience=PATIENCE)],
     )
 
     trainer.train()
+    preds_out = trainer.predict(val_ds)
+    raw_preds = np.argmax(preds_out.predictions, axis=-1)
+    log.info(f"Prediction distribution: 0={np.sum(raw_preds==0)}, 1={np.sum(raw_preds==1)}")
+    log.info(f"Label distribution: 0={np.sum(preds_out.label_ids==0)}, 1={np.sum(preds_out.label_ids==1)}")
+    for log_entry in trainer.state.log_history:
+        if "eval_f1" in log_entry:
+            log.info(f"    epoch {log_entry['epoch']:.0f}  eval_f1={log_entry['eval_f1']:.4f}")
     metrics = trainer.evaluate()
 
     # Optionally save adapter for final model
@@ -323,7 +332,6 @@ def _jsonify(obj):
     if isinstance(obj, list):
         return [_jsonify(i) for i in obj]
     return obj
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -522,6 +530,8 @@ def main():
             f"  Final dev →  F1={final['f1']:.4f}  "
             f"P={final['precision']:.4f}  R={final['recall']:.4f}"
         )
+
+
 
 
 if __name__ == "__main__":

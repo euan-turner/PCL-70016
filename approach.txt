@@ -11,11 +11,8 @@ R=32 best -> F1=0.4441, P=0.4643, R=0.4257
 
 3. Use keyword-stratified cross-validation
 4. Oversample from PCL examples to improve balance
-(very slow training, replace with class-weighted loss in 7)
-R=32 -> F1=0.4272, P=0.3277, R=0.6310
 
-5. Replace oversampling with class-weighted loss
-
+R=32 Final dev →  F1=0.4834  P=0.3710  R=0.6935
 
 6. Use span-level PCL annotations to swap spans and create new positive examples
 
