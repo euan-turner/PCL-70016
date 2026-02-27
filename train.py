@@ -187,6 +187,14 @@ def build_lora_model(rank: Optional[int]):
         bias="none",
     )
     model = get_peft_model(base, cfg)
+    
+    # Fix classifier head initialisation
+    for module in model.modules():
+        if isinstance(module, nn.Linear) and module.out_features == 2:
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
     trainable, total = model.get_nb_trainable_parameters()
     log.info(f"  LoRA r={rank}  trainable {trainable:,} / {total:,} "
              f"({100 * trainable / total:.2f}%)")
