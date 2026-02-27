@@ -1,5 +1,6 @@
-Need to beat an F1 of 0.48 on the dev set
-
+The task baseline model achieved:
+0.48 F1 on the official dev-set
+0.49 F1 on the official test-set
 
 Approach:
 1. Fine-tune DeBERTa-v3-large (304M) using LoRA
