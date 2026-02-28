@@ -7,14 +7,16 @@
 
 in rank_sweep_results.json
 
-decreasing lr due to small dataset size
-
 - [ ] CV for each LoRA rank 32 with different handling of class imbalance
-  ```python train.py --ranks 32 --folds 2 --epochs 10 --batch-size 16 --lr 2e-5 --max-length 128 --balance weight```
 
   weighted loss has not been effective - magnified gradients interacting badly with LoRA.
-python train.py --ranks 32 --folds 0 --balance oversample --lr 2e-5 --epochs 15
+python train.py --ranks 32 --folds 0 --balance oversample --lr 1e-4 --epochs 15
 
+- [ ] Tune decision threshold
+  ```python train.py --eval-adapter full_train_oversample```
 
-- [ ] Train best LoRA rank with back-translated augmentations
-  ```python train.py --ranks 16 --folds 0 --epochs 10 --batch-size 16 --lr 1e-4 --max-length 128 --balance oversample --masked```
+- [ ] Train with label sampling
+  ```python train.py --label-smoothing 0.1```
+ 
+- [ ] Train with softer oversampling ratio
+  ```python train.py --oversample-ratio 0.5```

@@ -14,6 +14,12 @@ R=32 best -> F1=0.4441, P=0.4643, R=0.4257
 
 R=32 Final dev →  F1=0.4834  P=0.3710  R=0.6935
 
+6. Threshold tuning in compute_metrics
+7. Label smoothing in cross entropy
+8. Reduce oversampling to avoid changing actual distribution too much
+9. Add linear classifier on [CLS] to predict PCL category on PCL samples
+
+
 6. Use span-level PCL annotations to swap spans and create new positive examples
 
 7. Use back-translation to augment PCL examples and improve diversity

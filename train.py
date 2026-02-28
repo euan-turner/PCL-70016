@@ -101,11 +101,17 @@ class PCLFinetuneDataset(Dataset):
         }
 
 class WeightedTrainer(Trainer):
-    """Trainer subclass that applies class-weighted cross-entropy."""
+    """Trainer subclass that applies class-weighted cross-entropy with optional label smoothing."""
 
-    def __init__(self, class_weights: Optional[torch.Tensor] = None, **kwargs):
+    def __init__(
+        self,
+        class_weights: Optional[torch.Tensor] = None,
+        label_smoothing: float = 0.0,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._class_weights = class_weights  # kept on CPU; moved lazily
+        self._label_smoothing = label_smoothing
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
@@ -114,9 +120,13 @@ class WeightedTrainer(Trainer):
 
         if self._class_weights is not None:
             w = self._class_weights.to(logits.device)
-            loss = nn.functional.cross_entropy(logits, labels, weight=w)
+            loss = nn.functional.cross_entropy(
+                logits, labels, weight=w, label_smoothing=self._label_smoothing
+            )
         else:
-            loss = nn.functional.cross_entropy(logits, labels)
+            loss = nn.functional.cross_entropy(
+                logits, labels, label_smoothing=self._label_smoothing
+            )
 
         return (loss, outputs) if return_outputs else loss
 
@@ -147,20 +157,28 @@ def make_strat_key(records: List[Dict]) -> np.ndarray:
     return np.array([f"{r['keyword']}_{r['label_binary']}" for r in records])
 
 
-def oversample_minority(records: List[Dict], seed: int = SEED) -> List[Dict]:
-    """Duplicate PCL samples until roughly balanced with NO_PCL."""
+def oversample_minority(records: List[Dict], seed: int = SEED, target_ratio: float = 1.0) -> List[Dict]:
+    """Duplicate PCL samples to reach *target_ratio* = pos / neg.
+
+    target_ratio=1.0 (default) fully balances the classes.
+    target_ratio=0.5 brings positive count to half of negative count.
+    If positives already meet or exceed the target, the dataset is returned unchanged.
+    """
     pos_idx = [i for i, r in enumerate(records) if r["label_binary"] == 1]
     neg_idx = [i for i, r in enumerate(records) if r["label_binary"] == 0]
-    if len(pos_idx) >= len(neg_idx):
+    target_pos = int(len(neg_idx) * target_ratio)
+    if len(pos_idx) >= target_pos:
         return list(records)
 
     rng = np.random.default_rng(seed)
-    n_needed = len(neg_idx) - len(pos_idx)
+    n_needed = target_pos - len(pos_idx)
     extra_idx = rng.choice(pos_idx, size=n_needed, replace=True).tolist()
     all_idx = neg_idx + pos_idx + extra_idx
     rng.shuffle(all_idx)
-    log.info(f"  Oversampled PCL: {len(pos_idx)} → {len(pos_idx) + n_needed} "
-             f"(total {len(all_idx)})")
+    log.info(
+        f"  Oversampled PCL: {len(pos_idx)} → {len(pos_idx) + n_needed} "
+        f"(target_ratio={target_ratio:.2f}, total {len(all_idx)})"
+    )
     return [records[i] for i in all_idx]
 
 
@@ -220,7 +238,7 @@ def train_fold(
 
     # Optionally oversample
     if args.balance in ("oversample", "both"):
-        train_records = oversample_minority(train_records, seed=args.seed)
+        train_records = oversample_minority(train_records, seed=args.seed, target_ratio=args.oversample_ratio)
         log.info(f"  train set size after oversample: {len(train_records)}, PCL: {sum(r['label_binary'] for r in train_records)}")
 
     train_ds = PCLFinetuneDataset(train_records, tokenizer, args.max_length)
@@ -284,6 +302,7 @@ def train_fold(
     cw = class_weights if args.balance in ("weight", "both") else None
     trainer = WeightedTrainer(
         class_weights=cw,
+        label_smoothing=args.label_smoothing,
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -319,6 +338,68 @@ def train_fold(
         "precision": metrics["eval_precision"],
         "recall": metrics["eval_recall"],
     }
+
+
+def evaluate_adapter(
+    adapter_path: Path,
+    dev_records: List[Dict],
+    tokenizer,
+    args: argparse.Namespace,
+) -> None:
+    """Load a saved PEFT adapter, run dev-set inference, and sweep decision thresholds."""
+    from peft import PeftModel
+
+    log.info(f"Loading base model from {MODEL_NAME!r}")
+    base = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=2, torch_dtype=torch.float32,
+    )
+    log.info(f"Loading adapter weights from {adapter_path}")
+    model = PeftModel.from_pretrained(base, str(adapter_path))
+    model.eval()
+
+    dev_ds = PCLFinetuneDataset(dev_records, tokenizer, args.max_length)
+
+    eval_args = TrainingArguments(
+        output_dir=str(adapter_path / "eval_tmp"),
+        per_device_eval_batch_size=args.batch_size * 2,
+        bf16=torch.cuda.is_available(),
+        report_to="none",
+        seed=args.seed,
+    )
+    trainer = Trainer(
+        model=model,
+        args=eval_args,
+        compute_metrics=compute_metrics,
+    )
+
+    preds_out = trainer.predict(dev_ds)
+    logits = preds_out.predictions
+    labels = preds_out.label_ids
+
+    default_metrics = compute_metrics((logits, labels))
+    log.info(
+        f"Default (argmax) →  F1={default_metrics['f1']:.4f}  "
+        f"P={default_metrics['precision']:.4f}  R={default_metrics['recall']:.4f}"
+    )
+
+    log.info("\nThreshold sweep:")
+    probs = torch.softmax(torch.tensor(logits, dtype=torch.float32), dim=-1)[:, 1]
+    best_threshold, best_f1 = 0.5, -1.0
+    for threshold in np.arange(0.2, 0.6, 0.02):
+        preds = (probs > threshold).long().numpy()
+        f1  = f1_score(labels, preds, pos_label=1, zero_division=0)
+        prec = precision_score(labels, preds, pos_label=1, zero_division=0)
+        rec  = recall_score(labels, preds, pos_label=1, zero_division=0)
+        log.info(f"  threshold={threshold:.2f}  f1={f1:.4f}  P={prec:.4f}  R={rec:.4f}")
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+
+    log.info(f"\n★ Best threshold = {best_threshold:.2f}  (F1 = {best_f1:.4f})")
+
+    del model, trainer, dev_ds
+    torch.cuda.empty_cache()
+    import gc; gc.collect()
 
 
 def _jsonify(obj):
@@ -357,6 +438,20 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print config and exit without training")
     parser.add_argument("--baseline", action="store_true", help="Run baseline evaluation with frozen backbone")
+    parser.add_argument(
+        "--eval-adapter", type=Path, default=None, metavar="ADAPTER_DIR",
+        help="Path to a saved PEFT adapter directory. Runs dev-set inference with "
+             "threshold sweep and exits (no training).",
+    )
+    parser.add_argument(
+        "--label-smoothing", type=float, default=0.0, metavar="ε",
+        help="Label-smoothing ε for cross-entropy loss (0 = disabled).",
+    )
+    parser.add_argument(
+        "--oversample-ratio", type=float, default=1.0, metavar="R",
+        help="Target pos/neg ratio for oversampling (1.0 = fully balanced, "
+             "0.5 = pos count = half of neg count).",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -376,6 +471,15 @@ def main():
         for k, v in vars(args).items():
             log.info(f"  {k}: {v}")
         build_lora_model(args.ranks[0])  # show param counts
+        return
+
+    if args.eval_adapter is not None:
+        log.info(f"Eval-adapter mode → {args.eval_adapter}")
+        suffix = "_masked" if args.masked else ""
+        dev_data = load_json(args.data_dir / f"dev{suffix}.json")
+        log.info(f"Dev set: {len(dev_data)} samples  (PCL={sum(r['label_binary'] for r in dev_data)})")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        evaluate_adapter(args.eval_adapter, dev_data, tokenizer, args)
         return
 
     if args.baseline:
