@@ -483,9 +483,9 @@ def load_official_splits(
 ) -> Dict[str, List[PCLItem]]:
     """Split items according to the official SemEval train/dev par_id lists.
 
-    The split CSV files contain ``par_id,label`` rows.  We only use par_id
-    to partition *items* into ``train`` and ``dev`` sets.  Items whose
-    par_id appears in neither file are reported but excluded.
+    The split CSV files contain ``par_id,label`` rows.  Items are returned in
+    the **same order as the CSV files** so that prediction files (dev.txt etc.)
+    align line-for-line with the official evaluation lists.
 
     Returns
     -------
@@ -493,25 +493,38 @@ def load_official_splits(
     """
     import csv, os
 
-    def _load_par_ids(path: str) -> set:
-        ids = set()
+    def _load_ordered_par_ids(path: str) -> List[int]:
+        """Return par_ids in CSV row order (preserving duplicates is fine; there are none)."""
+        ids = []
         with open(path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                ids.add(int(row["par_id"]))
+                ids.append(int(row["par_id"]))
         return ids
 
-    train_ids = _load_par_ids(os.path.join(splits_dir, "train_semeval_parids-labels.csv"))
-    dev_ids   = _load_par_ids(os.path.join(splits_dir, "dev_semeval_parids-labels.csv"))
+    train_ids_ordered = _load_ordered_par_ids(os.path.join(splits_dir, "train_semeval_parids-labels.csv"))
+    dev_ids_ordered   = _load_ordered_par_ids(os.path.join(splits_dir, "dev_semeval_parids-labels.csv"))
 
-    train, dev, unmatched = [], [], []
-    for item in items:
-        if item.par_id in train_ids:
-            train.append(item)
-        elif item.par_id in dev_ids:
-            dev.append(item)
-        else:
-            unmatched.append(item)
+    # Build lookup: par_id → PCLItem
+    item_by_id: Dict[int, PCLItem] = {item.par_id: item for item in items}
+
+    def _collect(ordered_ids, name):
+        result, missing = [], []
+        for pid in ordered_ids:
+            if pid in item_by_id:
+                result.append(item_by_id[pid])
+            else:
+                missing.append(pid)
+        if missing:
+            print(f"  (!) {len(missing)} par_ids in {name} CSV not found in cleaned items — excluded")
+        return result
+
+    train = _collect(train_ids_ordered, "train")
+    dev   = _collect(dev_ids_ordered,   "dev")
+
+    # Report any items that appear in neither split
+    all_split_ids = set(train_ids_ordered) | set(dev_ids_ordered)
+    unmatched = [item for item in items if item.par_id not in all_split_ids]
 
     print(f"Official split: train={len(train)}, dev={len(dev)}")
     if unmatched:

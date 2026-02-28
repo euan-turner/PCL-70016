@@ -7,13 +7,18 @@
 
 in rank_sweep_results.json
 
-- [ ] CV for each LoRA rank 32 with different handling of class imbalance
+- [x] CV for each LoRA rank 32 with different handling of class imbalance
 
   weighted loss has not been effective - magnified gradients interacting badly with LoRA.
-python train.py --ranks 32 --folds 0 --balance oversample --lr 1e-4 --epochs 15
+```python train.py --ranks 32 --folds 0 --balance oversample --lr 1e-4 --batch-size 16 --epochs 15```
 
-- [ ] Tune decision threshold
+- [x] Tune decision threshold
   ```python train.py --eval-adapter full_train_oversample```
+No impact, consistent across thresholds
+
+Re-do the above with official splits used properly
+
+- [ ] Train with masked entities
 
 - [ ] Train with label sampling
   ```python train.py --label-smoothing 0.1```

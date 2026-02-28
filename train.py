@@ -61,7 +61,7 @@ BATCH_SIZE = 8
 GRAD_ACCUM = 4            # effective batch = BATCH_SIZE × GRAD_ACCUM = 32
 LR = 1e-4                 # Standard LoRA LR (adapters start at zero, need higher LR)
 WEIGHT_DECAY = 0.01
-WARMUP_RATIO = 0.1
+WARMUP_STEPS=50
 PATIENCE = 7              # early-stopping patience (epochs)
 
 DATA_DIR = Path("preprocessed")
@@ -282,7 +282,7 @@ def train_fold(
         gradient_accumulation_steps=GRAD_ACCUM,
         learning_rate=args.lr,
         weight_decay=WEIGHT_DECAY,
-        warmup_ratio=WARMUP_RATIO,
+        warmup_steps=WARMUP_STEPS,
         lr_scheduler_type="cosine",
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -327,6 +327,17 @@ def train_fold(
         model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
         log.info(f"  Saved final adapter → {save_dir}")
+        # explicitly save classifier head as well
+        base_model = model.base_model.model  # unwrap PeftModel → PeftModelForSequenceClassification → base
+        classifier_state = {
+            "classifier.weight": base_model.classifier.weight.data.cpu(),
+            "classifier.bias": base_model.classifier.bias.data.cpu(),
+            "pooler.dense.weight": base_model.pooler.dense.weight.data.cpu(),
+            "pooler.dense.bias": base_model.pooler.dense.bias.data.cpu(),
+        }
+        torch.save(classifier_state, save_dir / "classifier_head.pt")
+        log.info(f"  Saved classifier head → {save_dir / 'classifier_head.pt'}")
+
 
     # Free GPU + CPU memory aggressively to avoid OOM killer
     del model, trainer, train_ds, val_ds
@@ -342,11 +353,12 @@ def train_fold(
 
 def evaluate_adapter(
     adapter_path: Path,
-    dev_records: List[Dict],
+    val_records: List[Dict],
+    test_records: List[Dict],
     tokenizer,
     args: argparse.Namespace,
 ) -> None:
-    """Load a saved PEFT adapter, run dev-set inference, and sweep decision thresholds."""
+    """Load a saved PEFT adapter, run val/test inference, save predictions to dev.txt/test.txt."""
     from peft import PeftModel
 
     log.info(f"Loading base model from {MODEL_NAME!r}")
@@ -355,9 +367,19 @@ def evaluate_adapter(
     )
     log.info(f"Loading adapter weights from {adapter_path}")
     model = PeftModel.from_pretrained(base, str(adapter_path))
-    model.eval()
+    head_path = adapter_path / "classifier_head.pt"
+    if head_path.exists():
+        head_state = torch.load(head_path, map_location="cpu")
+        base_model = model.base_model.model
+        base_model.classifier.weight.data.copy_(head_state["classifier.weight"])
+        base_model.classifier.bias.data.copy_(head_state["classifier.bias"])
+        base_model.pooler.dense.weight.data.copy_(head_state["pooler.dense.weight"])
+        base_model.pooler.dense.bias.data.copy_(head_state["pooler.dense.bias"])
+        log.info("  Loaded classifier head from classifier_head.pt")
+    else:
+        log.warning("  No classifier_head.pt found — head weights are random!")
 
-    dev_ds = PCLFinetuneDataset(dev_records, tokenizer, args.max_length)
+    model.eval()
 
     eval_args = TrainingArguments(
         output_dir=str(adapter_path / "eval_tmp"),
@@ -369,35 +391,38 @@ def evaluate_adapter(
     trainer = Trainer(
         model=model,
         args=eval_args,
-        compute_metrics=compute_metrics,
     )
 
-    preds_out = trainer.predict(dev_ds)
-    logits = preds_out.predictions
-    labels = preds_out.label_ids
+    log.info(f"\nRunning inference on val set ({len(val_records)} examples) …")
+    val_ds = PCLFinetuneDataset(val_records, tokenizer, args.max_length)
+    val_out = trainer.predict(val_ds)
+    val_preds = np.argmax(val_out.predictions, axis=-1)
+    val_labels = val_out.label_ids
 
-    default_metrics = compute_metrics((logits, labels))
+    val_metrics = compute_metrics((val_out.predictions, val_labels))
     log.info(
-        f"Default (argmax) →  F1={default_metrics['f1']:.4f}  "
-        f"P={default_metrics['precision']:.4f}  R={default_metrics['recall']:.4f}"
+        f"Validation →  F1={val_metrics['f1']:.4f}  "
+        f"P={val_metrics['precision']:.4f}  R={val_metrics['recall']:.4f}"
     )
 
-    log.info("\nThreshold sweep:")
-    probs = torch.softmax(torch.tensor(logits, dtype=torch.float32), dim=-1)[:, 1]
-    best_threshold, best_f1 = 0.5, -1.0
-    for threshold in np.arange(0.2, 0.6, 0.02):
-        preds = (probs > threshold).long().numpy()
-        f1  = f1_score(labels, preds, pos_label=1, zero_division=0)
-        prec = precision_score(labels, preds, pos_label=1, zero_division=0)
-        rec  = recall_score(labels, preds, pos_label=1, zero_division=0)
-        log.info(f"  threshold={threshold:.2f}  f1={f1:.4f}  P={prec:.4f}  R={rec:.4f}")
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = threshold
+    dev_txt_path = Path("dev.txt")
+    with open(dev_txt_path, "w") as fh:
+        for pred in val_preds:
+            fh.write(f"{int(pred)}\n")
+    log.info(f"Saved {len(val_preds)} predictions → {dev_txt_path}")
 
-    log.info(f"\n★ Best threshold = {best_threshold:.2f}  (F1 = {best_f1:.4f})")
+    log.info(f"\nRunning inference on test set ({len(test_records)} examples) …")
+    test_ds = PCLFinetuneDataset(test_records, tokenizer, args.max_length)
+    test_out = trainer.predict(test_ds)
+    test_preds = np.argmax(test_out.predictions, axis=-1)
 
-    del model, trainer, dev_ds
+    test_txt_path = Path("test.txt")
+    with open(test_txt_path, "w") as fh:
+        for pred in test_preds:
+            fh.write(f"{int(pred)}\n")
+    log.info(f"Saved {len(test_preds)} predictions → {test_txt_path}")
+
+    del model, trainer, val_ds, test_ds
     torch.cuda.empty_cache()
     import gc; gc.collect()
 
@@ -459,9 +484,9 @@ def main():
 
     suffix = "_masked" if args.masked else ""
     train_data = load_json(args.data_dir / f"train{suffix}.json")
-    dev_data = load_json(args.data_dir / f"dev{suffix}.json")
+    dev_data = load_json(args.data_dir / f"val{suffix}.json")
     log.info(f"Data: train={len(train_data)} (PCL={sum(r['label_binary'] for r in train_data)})  "
-             f"dev={len(dev_data)} (PCL={sum(r['label_binary'] for r in dev_data)})")
+             f"val={len(dev_data)} (PCL={sum(r['label_binary'] for r in dev_data)})")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     class_weights = compute_class_weights(train_data)
@@ -476,16 +501,20 @@ def main():
     if args.eval_adapter is not None:
         log.info(f"Eval-adapter mode → {args.eval_adapter}")
         suffix = "_masked" if args.masked else ""
-        dev_data = load_json(args.data_dir / f"dev{suffix}.json")
-        log.info(f"Dev set: {len(dev_data)} samples  (PCL={sum(r['label_binary'] for r in dev_data)})")
+        val_data = load_json(args.data_dir / f"val{suffix}.json")
+        test_data = load_json(args.data_dir / f"test{suffix}.json")
+        log.info(
+            f"Val set:  {len(val_data)} samples  (PCL={sum(r['label_binary'] for r in val_data)})\n"
+            f"Test set: {len(test_data)} samples"
+        )
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        evaluate_adapter(args.eval_adapter, dev_data, tokenizer, args)
+        evaluate_adapter(args.eval_adapter, val_data, test_data, tokenizer, args)
         return
 
     if args.baseline:
         log.info("Running baseline evaluation with frozen backbone")
         train_data = load_json(args.data_dir / f"train{suffix}.json")
-        dev_data = load_json(args.data_dir / f"dev{suffix}.json")
+        dev_data = load_json(args.data_dir / f"val{suffix}.json")
 
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         class_weights = compute_class_weights(train_data)

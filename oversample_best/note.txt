@@ -1,0 +1,4 @@
+Trained with:
+```python train.py --ranks 32 --folds 0 --balance oversample --lr 1e-4 --batch-size 16 --epochs 15```
+
+Achieves validation F1=0.5205  P=0.4770  R=0.5729
