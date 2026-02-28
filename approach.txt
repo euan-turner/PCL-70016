@@ -14,8 +14,14 @@ R=32 best -> F1=0.4441, P=0.4643, R=0.4257
 
 R=32 Final dev →  F1=0.5205  P=0.4770  R=0.5729
 
-6. Threshold tuning in compute_metrics
+5. Train with masked entitiy tokens to reduce bias
+No improvement: Final dev F1=0.5098  P=0.4976  R=0.5226
+
 7. Label smoothing in cross entropy
+
+No improvement: Final dev F1=0.1738  P=0.0952  R=1.0000
+
+
 8. Reduce oversampling to avoid changing actual distribution too much
 9. Add linear classifier on [CLS] to predict PCL category on PCL samples
 

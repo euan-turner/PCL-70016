@@ -18,10 +18,12 @@ No impact, consistent across thresholds
 
 Re-do the above with official splits used properly
 
-- [ ] Train with masked entities
+- [x] Train with masked entities
+```python train.py --ranks 32 --folds 0 --balance oversample --lr 1e-4 --batch-size 16 --epochs 15 --masked```
 
-- [ ] Train with label sampling
+- [x] Train with label sampling
   ```python train.py --label-smoothing 0.1```
  
-- [ ] Train with softer oversampling ratio
-  ```python train.py --oversample-ratio 0.5```
+- [ ] Train with classification head
+  ```python train.py --ranks 32 --folds 0 --balance oversample --lr 1e-4 --batch-size 16 --epochs 30 --multi-head
+python train.py --eval-adapter <adapter_dir> --multi-head```

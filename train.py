@@ -22,11 +22,13 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset
 
@@ -43,6 +45,7 @@ from transformers import (
     EarlyStoppingCallback,
     set_seed,
 )
+from transformers.modeling_outputs import ModelOutput
 from peft import LoraConfig, get_peft_model, TaskType
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score, precision_score, recall_score
@@ -62,10 +65,20 @@ GRAD_ACCUM = 4            # effective batch = BATCH_SIZE × GRAD_ACCUM = 32
 LR = 1e-4                 # Standard LoRA LR (adapters start at zero, need higher LR)
 WEIGHT_DECAY = 0.01
 WARMUP_STEPS=50
-PATIENCE = 7              # early-stopping patience (epochs)
+PATIENCE = 10             # early-stopping patience (epochs)
 
 DATA_DIR = Path("preprocessed")
 OUTPUT_DIR = Path("outputs")
+CATEGORIES_TSV = Path("Dont_Patronize_Me_Trainingset/dontpatronizeme_categories.tsv")
+
+# PCL category head constants
+PCL_CATEGORIES = [
+    "Authority_voice", "Compassion", "Metaphors", "Presupposition",
+    "Shallow_solution", "The_poorer_the_merrier", "Unbalanced_power_relations",
+]
+NUM_PCL_CATEGORIES = len(PCL_CATEGORIES)
+DEBERTA_HIDDEN_SIZE = 1024   # DeBERTa-v3-large hidden dim
+CATEGORY_LOSS_WEIGHT = 0.5   # weight of multi-label BCE loss relative to binary CE loss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,12 +88,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 class PCLFinetuneDataset(Dataset):
-    """Tokenised dataset for binary PCL classification."""
+    """Tokenised dataset for binary PCL classification.
 
-    def __init__(self, records: List[Dict], tokenizer, max_length: int = MAX_LENGTH):
+    If ``category_map`` is provided (a dict mapping par_id → multi-hot list),
+    each item also contains a ``category_labels`` tensor of shape (NUM_PCL_CATEGORIES,).
+    For non-PCL samples, ``category_labels`` is all-zeros (the loss masks them out).
+    """
+
+    def __init__(
+        self,
+        records: List[Dict],
+        tokenizer,
+        max_length: int = MAX_LENGTH,
+        category_map: Optional[Dict] = None,
+    ):
         self.records = records
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.category_map = category_map  # par_id → List[int] multi-hot, or None
 
     def __len__(self):
         return len(self.records)
@@ -94,44 +119,130 @@ class PCLFinetuneDataset(Dataset):
             max_length=self.max_length,
             return_tensors="pt",
         )
-        return {
+        item = {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
             "labels": torch.tensor(rec["label_binary"], dtype=torch.long),
         }
+        if self.category_map is not None:
+            par_id = rec["par_id"]
+            multi_hot = self.category_map.get(par_id, [0] * NUM_PCL_CATEGORIES)
+            item["category_labels"] = torch.tensor(multi_hot, dtype=torch.float32)
+        return item
+
+@dataclass
+class DualHeadOutput(ModelOutput):
+    """Model output for the dual-head PCL model.
+
+    ``logits``          — (B, 2) binary PCL logits (used by Trainer for metrics/predictions)
+    ``category_logits`` — (B, NUM_PCL_CATEGORIES) multi-label category logits
+    """
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    category_logits: Optional[torch.FloatTensor] = None
+
+
+class DualHeadPCLModel(nn.Module):
+    """Wraps a sequence-classification backbone and adds a multi-label PCL category head.
+
+    The binary classification head comes from the backbone unchanged.
+    The category head is a fresh linear layer on the last-layer [CLS] representation.
+    Category loss is only computed on PCL-positive samples.
+    """
+
+    def __init__(self, backbone: nn.Module, num_categories: int = NUM_PCL_CATEGORIES,
+                 hidden_size: int = DEBERTA_HIDDEN_SIZE):
+        super().__init__()
+        self.backbone = backbone
+        self.category_head = nn.Linear(hidden_size, num_categories)
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        category_labels=None,
+        **kwargs,
+    ):
+        # Run backbone; request hidden states so we can feed the CLS token to the category head
+        out = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            **kwargs,
+        )
+        # Last-layer [CLS] representation → category head
+        cls_repr = out.hidden_states[-1][:, 0, :]      # (B, hidden_size)
+        cat_logits = self.category_head(cls_repr)       # (B, num_categories)
+        return DualHeadOutput(logits=out.logits, category_logits=cat_logits)
+
+    def save_pretrained(self, save_dir: Path):
+        """Save backbone adapter + category head weights."""
+        self.backbone.save_pretrained(str(save_dir))
+        torch.save(self.category_head.state_dict(), Path(save_dir) / "category_head.pt")
+
 
 class WeightedTrainer(Trainer):
-    """Trainer subclass that applies class-weighted cross-entropy with optional label smoothing."""
+    """Trainer subclass that applies class-weighted cross-entropy with optional label smoothing.
+
+    When the model returns a ``DualHeadOutput`` and ``category_labels`` are present
+    in the batch, an additional multi-label BCE loss (scaled by ``cat_loss_weight``)
+    is computed over PCL-positive samples only.
+    """
 
     def __init__(
         self,
         class_weights: Optional[torch.Tensor] = None,
         label_smoothing: float = 0.0,
+        cat_loss_weight: float = CATEGORY_LOSS_WEIGHT,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._class_weights = class_weights  # kept on CPU; moved lazily
         self._label_smoothing = label_smoothing
+        self._cat_loss_weight = cat_loss_weight
+        # Prevent the Trainer from also collecting category_labels into label_ids.
+        # Without this, DualHeadPCLModel's forward signature causes the Trainer to
+        # set label_names=["labels","category_labels"], making EvalPrediction.label_ids
+        # a tuple of length 2 and breaking compute_metrics.
+        self.label_names = ["labels"]
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
+        # category_labels may not be present (single-head mode or test inference)
+        category_labels = inputs.pop("category_labels", None)
 
+        outputs = model(**inputs)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+
+        # Binary cross-entropy loss
         if self._class_weights is not None:
             w = self._class_weights.to(logits.device)
-            loss = nn.functional.cross_entropy(
-                logits, labels, weight=w, label_smoothing=self._label_smoothing
-            )
+            loss = F.cross_entropy(logits, labels, weight=w, label_smoothing=self._label_smoothing)
         else:
-            loss = nn.functional.cross_entropy(
-                logits, labels, label_smoothing=self._label_smoothing
-            )
+            loss = F.cross_entropy(logits, labels, label_smoothing=self._label_smoothing)
+
+        # Multi-label category loss — only for PCL-positive samples, only in dual-head mode
+        if (
+            category_labels is not None
+            and hasattr(outputs, "category_logits")
+            and outputs.category_logits is not None
+        ):
+            pcl_mask = labels == 1
+            if pcl_mask.any():
+                cat_loss = F.binary_cross_entropy_with_logits(
+                    outputs.category_logits[pcl_mask],
+                    category_labels[pcl_mask],
+                )
+                loss = loss + self._cat_loss_weight * cat_loss
 
         return (loss, outputs) if return_outputs else loss
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
+    # DualHeadPCLModel returns (binary_logits, category_logits) as a tuple
+    if isinstance(logits, tuple):
+        logits = logits[0]
     preds = np.argmax(logits, axis=-1)
     f1 = f1_score(labels, preds, pos_label=1, zero_division=0)
     precision = precision_score(labels, preds, pos_label=1, zero_division=0)
@@ -150,6 +261,36 @@ def compute_class_weights(records: List[Dict], alpha=1.0) -> torch.Tensor:
     weights = (len(labels) / (2.0 * counts)) ** alpha
     log.info(f"Class weights  NO_PCL={weights[0]:.3f}  PCL={weights[1]:.3f}")
     return torch.tensor(weights, dtype=torch.float32)
+
+
+def load_category_labels(
+    tsv_path: Path = CATEGORIES_TSV,
+) -> Dict[int, List[int]]:
+    """Parse dontpatronizeme_categories.tsv into per-paragraph multi-hot vectors.
+
+    Returns ``{par_id: multi_hot_list}`` where ``multi_hot_list`` is a binary
+    list of length ``NUM_PCL_CATEGORIES`` aligned with ``PCL_CATEGORIES``.
+    Only paragraphs that appear in the TSV (i.e. PCL samples) have entries.
+    """
+    cat_index = {cat: i for i, cat in enumerate(PCL_CATEGORIES)}
+    par_cats: Dict[int, List[int]] = {}
+    with open(tsv_path) as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 9:
+                continue
+            try:
+                par_id = int(parts[0])
+            except ValueError:
+                continue
+            cat = parts[8].strip()
+            if cat not in cat_index:
+                continue
+            if par_id not in par_cats:
+                par_cats[par_id] = [0] * NUM_PCL_CATEGORIES
+            par_cats[par_id][cat_index[cat]] = 1
+    log.info(f"Loaded category labels for {len(par_cats)} paragraphs from {tsv_path}")
+    return par_cats
 
 
 def make_strat_key(records: List[Dict]) -> np.ndarray:
@@ -182,10 +323,12 @@ def oversample_minority(records: List[Dict], seed: int = SEED, target_ratio: flo
     return [records[i] for i in all_idx]
 
 
-def build_lora_model(rank: Optional[int]):
+def build_lora_model(rank: Optional[int], multi_head: bool = False):
     """Load pretrained DeBERTa-v3-large and attach LoRA adapters.
 
-    If `rank` is None the base model is returned and no PEFT/LoRA is applied.
+    If ``rank`` is None the base model is returned and no PEFT/LoRA is applied.
+    If ``multi_head`` is True the model is wrapped in ``DualHeadPCLModel`` which
+    adds a secondary multi-label PCL category classification head.
     """
     base = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, num_labels=2, torch_dtype=torch.float32,
@@ -193,21 +336,27 @@ def build_lora_model(rank: Optional[int]):
 
     if rank is None:
         log.info("  No LoRA/PEFT requested — using base model")
-        return base
+        model = base
+    else:
+        cfg = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=rank,
+            lora_alpha=rank * LORA_ALPHA_MULT,
+            lora_dropout=LORA_DROPOUT,
+            target_modules=TARGET_MODULES,
+            bias="none",
+        )
+        model = get_peft_model(base, cfg)
 
-    cfg = LoraConfig(
-        task_type=TaskType.SEQ_CLS,
-        r=rank,
-        lora_alpha=rank * LORA_ALPHA_MULT,
-        lora_dropout=LORA_DROPOUT,
-        target_modules=TARGET_MODULES,
-        bias="none",
-    )
-    model = get_peft_model(base, cfg)
+        trainable, total = model.get_nb_trainable_parameters()
+        log.info(f"  LoRA r={rank}  trainable {trainable:,} / {total:,} "
+                 f"({100 * trainable / total:.2f}%)")
 
-    trainable, total = model.get_nb_trainable_parameters()
-    log.info(f"  LoRA r={rank}  trainable {trainable:,} / {total:,} "
-             f"({100 * trainable / total:.2f}%)")
+    if multi_head:
+        model = DualHeadPCLModel(model)
+        log.info(f"  Dual-head mode: added category head "
+                 f"({NUM_PCL_CATEGORIES} classes: {', '.join(PCL_CATEGORIES)})")
+
     return model
 
 
@@ -223,16 +372,11 @@ def train_fold(
     args: argparse.Namespace,
     model: Optional[nn.Module] = None,
     freeze_backbone: bool = False,
+    category_map: Optional[Dict] = None,
 ) -> Dict[str, float]:
-    
-    dev_data = load_json(args.data_dir / "dev.json")
-    val_records = dev_data  # override fold val
-    
-    log.info(f"DEBUG: forcing val_records to dev.json ({len(val_records)} samples)")
-    
     """Train one (fold, rank) combination. Returns val metrics dict."""
     log.info(f"  Fold {fold}  train={len(train_records)}  val={len(val_records)}")
-    
+
     log.info(f"  val set size: {len(val_records)}, PCL in val: {sum(r['label_binary'] for r in val_records)}")
     log.info(f"  train set size before oversample: {len(train_records)}, PCL: {sum(r['label_binary'] for r in train_records)}")
 
@@ -241,12 +385,12 @@ def train_fold(
         train_records = oversample_minority(train_records, seed=args.seed, target_ratio=args.oversample_ratio)
         log.info(f"  train set size after oversample: {len(train_records)}, PCL: {sum(r['label_binary'] for r in train_records)}")
 
-    train_ds = PCLFinetuneDataset(train_records, tokenizer, args.max_length)
-    val_ds = PCLFinetuneDataset(val_records, tokenizer, args.max_length)
+    train_ds = PCLFinetuneDataset(train_records, tokenizer, args.max_length, category_map=category_map)
+    val_ds   = PCLFinetuneDataset(val_records,   tokenizer, args.max_length, category_map=category_map)
 
     # If a model was provided (e.g. baseline), use it; otherwise build/apply LoRA
     if model is None:
-        model = build_lora_model(rank)
+        model = build_lora_model(rank, multi_head=getattr(args, "multi_head", False))
     else:
         log.info("  Using provided base model (no LoRA applied)")
 
@@ -298,37 +442,56 @@ def train_fold(
         max_grad_norm=1.0,
     )
 
+    # Exclude category_logits from eval predictions so compute_metrics only sees binary logits
+    dual_head = isinstance(model, DualHeadPCLModel)
+    ignore_keys = ["category_logits"] if dual_head else None
+
     # Use class-weighted loss if set; otherwise vanilla cross-entropy
     cw = class_weights if args.balance in ("weight", "both") else None
     trainer = WeightedTrainer(
         class_weights=cw,
         label_smoothing=args.label_smoothing,
+        cat_loss_weight=getattr(args, "cat_loss_weight", CATEGORY_LOSS_WEIGHT),
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
         compute_metrics=compute_metrics,
-        # callbacks=[EarlyStoppingCallback(early_stopping_patience=PATIENCE)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=PATIENCE)],
     )
 
     trainer.train()
-    preds_out = trainer.predict(val_ds)
-    raw_preds = np.argmax(preds_out.predictions, axis=-1)
+    preds_out = trainer.predict(val_ds, ignore_keys=ignore_keys)
+    raw_preds_input = preds_out.predictions
+    if isinstance(raw_preds_input, tuple):
+        raw_preds_input = raw_preds_input[0]  # take binary logits when dual-head
+    raw_preds = np.argmax(raw_preds_input, axis=-1)
     log.info(f"Prediction distribution: 0={np.sum(raw_preds==0)}, 1={np.sum(raw_preds==1)}")
     log.info(f"Label distribution: 0={np.sum(preds_out.label_ids==0)}, 1={np.sum(preds_out.label_ids==1)}")
     for log_entry in trainer.state.log_history:
         if "eval_f1" in log_entry:
             log.info(f"    epoch {log_entry['epoch']:.0f}  eval_f1={log_entry['eval_f1']:.4f}")
-    metrics = trainer.evaluate()
+    metrics = trainer.evaluate(ignore_keys=ignore_keys)
 
     # Optionally save adapter for final model
     if fold == "final":
         save_dir = output_dir / f"best_rank{rank}_final"
-        model.save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
-        log.info(f"  Saved final adapter → {save_dir}")
-        # explicitly save classifier head as well
-        base_model = model.base_model.model  # unwrap PeftModel → PeftModelForSequenceClassification → base
+
+        if dual_head:
+            # DualHeadPCLModel.save_pretrained saves backbone adapter + category_head.pt
+            model.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
+            log.info(f"  Saved dual-head adapter + category head → {save_dir}")
+            # Save binary classifier head from the wrapped backbone
+            peft_model = model.backbone
+        else:
+            model.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
+            log.info(f"  Saved final adapter → {save_dir}")
+            peft_model = model
+
+        # Explicitly save the binary classifier head weights
+        base_model = peft_model.base_model.model
         classifier_state = {
             "classifier.weight": base_model.classifier.weight.data.cpu(),
             "classifier.bias": base_model.classifier.bias.data.cpu(),
@@ -361,6 +524,8 @@ def evaluate_adapter(
     """Load a saved PEFT adapter, run val/test inference, save predictions to dev.txt/test.txt."""
     from peft import PeftModel
 
+    multi_head = getattr(args, "multi_head", False)
+
     log.info(f"Loading base model from {MODEL_NAME!r}")
     base = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, num_labels=2, torch_dtype=torch.float32,
@@ -379,7 +544,21 @@ def evaluate_adapter(
     else:
         log.warning("  No classifier_head.pt found — head weights are random!")
 
+    # Optionally restore dual-head category head
+    if multi_head:
+        model = DualHeadPCLModel(model)
+        cat_head_path = adapter_path / "category_head.pt"
+        if cat_head_path.exists():
+            model.category_head.load_state_dict(
+                torch.load(cat_head_path, map_location="cpu")
+            )
+            log.info("  Loaded category head from category_head.pt")
+        else:
+            log.warning("  No category_head.pt found — category head weights are random!")
+
     model.eval()
+
+    ignore_keys = ["category_logits"] if multi_head else None
 
     eval_args = TrainingArguments(
         output_dir=str(adapter_path / "eval_tmp"),
@@ -391,15 +570,21 @@ def evaluate_adapter(
     trainer = Trainer(
         model=model,
         args=eval_args,
+        # compute_metrics intentionally omitted: metrics are computed manually
+        # for val only; test labels are -1 (unlabelled) so automatic metric
+        # computation would crash.
     )
 
     log.info(f"\nRunning inference on val set ({len(val_records)} examples) …")
     val_ds = PCLFinetuneDataset(val_records, tokenizer, args.max_length)
-    val_out = trainer.predict(val_ds)
-    val_preds = np.argmax(val_out.predictions, axis=-1)
+    val_out = trainer.predict(val_ds, ignore_keys=ignore_keys)
+    val_preds_raw = val_out.predictions
+    if isinstance(val_preds_raw, tuple):
+        val_preds_raw = val_preds_raw[0]
+    val_preds = np.argmax(val_preds_raw, axis=-1)
     val_labels = val_out.label_ids
 
-    val_metrics = compute_metrics((val_out.predictions, val_labels))
+    val_metrics = compute_metrics((val_preds_raw, val_labels))
     log.info(
         f"Validation →  F1={val_metrics['f1']:.4f}  "
         f"P={val_metrics['precision']:.4f}  R={val_metrics['recall']:.4f}"
@@ -413,8 +598,11 @@ def evaluate_adapter(
 
     log.info(f"\nRunning inference on test set ({len(test_records)} examples) …")
     test_ds = PCLFinetuneDataset(test_records, tokenizer, args.max_length)
-    test_out = trainer.predict(test_ds)
-    test_preds = np.argmax(test_out.predictions, axis=-1)
+    test_out = trainer.predict(test_ds, ignore_keys=ignore_keys)
+    test_preds_raw = test_out.predictions
+    if isinstance(test_preds_raw, tuple):
+        test_preds_raw = test_preds_raw[0]
+    test_preds = np.argmax(test_preds_raw, axis=-1)
 
     test_txt_path = Path("test.txt")
     with open(test_txt_path, "w") as fh:
@@ -477,10 +665,32 @@ def main():
         help="Target pos/neg ratio for oversampling (1.0 = fully balanced, "
              "0.5 = pos count = half of neg count).",
     )
+    parser.add_argument(
+        "--multi-head", action="store_true",
+        help="Attach a secondary multi-label category head trained on PCL-positive samples. "
+             "Must also be set when evaluating a model that was trained with this flag.",
+    )
+    parser.add_argument(
+        "--cat-loss-weight", type=float, default=CATEGORY_LOSS_WEIGHT, metavar="W",
+        help="Weight of the multi-label category BCE loss relative to the binary classification loss.",
+    )
+    parser.add_argument(
+        "--categories-tsv", type=Path, default=CATEGORIES_TSV, metavar="PATH",
+        help="Path to dontpatronizeme_categories.tsv.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load category labels once if dual-head mode is enabled
+    category_map: Optional[Dict] = None
+    if args.multi_head:
+        category_map = load_category_labels(args.categories_tsv)
+        log.info(
+            f"Multi-head mode: {NUM_PCL_CATEGORIES} categories, "
+            f"cat_loss_weight={args.cat_loss_weight}"
+        )
 
     suffix = "_masked" if args.masked else ""
     train_data = load_json(args.data_dir / f"train{suffix}.json")
@@ -583,6 +793,7 @@ def main():
                     class_weights=class_weights,
                     output_dir=args.output_dir,
                     args=args,
+                    category_map=category_map,
                 )
                 fold_metrics.append(m)
                 log.info(f"  Fold {fold_idx} →  F1={m['f1']:.4f}  "
@@ -614,6 +825,7 @@ def main():
                 class_weights=class_weights,
                 output_dir=args.output_dir,
                 args=args,
+                category_map=category_map,
             )
             log.info(f"  rank {rank} dev →  F1={m['f1']:.4f}  "
                      f"P={m['precision']:.4f}  R={m['recall']:.4f}")
@@ -658,6 +870,7 @@ def main():
             class_weights=class_weights,
             output_dir=args.output_dir,
             args=args,
+            category_map=category_map,
         )
         log.info(
             f"  Final dev →  F1={final['f1']:.4f}  "
